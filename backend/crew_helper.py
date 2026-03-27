@@ -11,7 +11,7 @@ os.environ['GEMINI_API_KEY'] = GEMINI_API_KEY if GEMINI_API_KEY else ""
 
 # Initialize LLM
 try:
-    llm = LLM(model="gemini/gemini-1.5-flash")
+    llm = LLM(model="gemini/gemini-2.5-flash")
 except Exception as e:
     llm = None
 

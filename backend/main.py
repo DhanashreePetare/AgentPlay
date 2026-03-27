@@ -9,7 +9,7 @@ import asyncio
 from mtranslate import translate
 import json
 import os
-import edge_tts
+from gtts import gTTS
 from crew_helper import count_words_and_translate, translate_segment
 import asyncio
 import faiss
@@ -32,25 +32,25 @@ try:
 except ImportError:
     pass
 
-# Voice configurations
+# Voice configurations for gTTS (language codes)
 VOICE_CONFIGS = {
-    'en': "en-US-JennyNeural",
-    'hi': "hi-IN-SwaraNeural",
-    'es': "es-MX-JorgeNeural",
-    'fr': "fr-FR-HenriNeural",
-    'de': "de-DE-KillianNeural",
-    'ja': "ja-JP-KeitaNeural",
-    'ko': "ko-KR-SunHiNeural",
-    'zh': "zh-CN-XiaoxiaoNeural",
-    'it': "it-IT-DiegoNeural",
-    'pt': "pt-BR-AntonioNeural",
-    'ru': "ru-RU-DmitryNeural",
-    'nl': "nl-NL-MaartenNeural",
-    'tr': "tr-TR-AhmetNeural",
-    'pl': "pl-PL-MarekNeural",
-    'id': "id-ID-ArdiNeural",
-    'th': "th-TH-NiwatNeural",
-    'vi': "vi-VN-HoaiMyNeural"
+    'en': 'en',
+    'hi': 'hi',
+    'es': 'es',
+    'fr': 'fr',
+    'de': 'de',
+    'ja': 'ja',
+    'ko': 'ko',
+    'zh': 'zh-CN',
+    'it': 'it',
+    'pt': 'pt',
+    'ru': 'ru',
+    'nl': 'nl',
+    'tr': 'tr',
+    'pl': 'pl',
+    'id': 'id',
+    'th': 'th',
+    'vi': 'vi'
 }
 
 LANGUAGE_MAP = {
@@ -74,9 +74,9 @@ LANGUAGE_MAP = {
 }
 
 # Rate limiting settings 
-RATE_LIMIT_DELAY = 2  # Delay in seconds between API requests
+RATE_LIMIT_DELAY = 3  # Delay in seconds between API requests
 MAX_RETRIES = 3  # Maximum number of retries for failed requests
-MAX_CONCURRENT_REQUESTS = 2  # Limit the number of concurrent requests 
+MAX_CONCURRENT_REQUESTS = 1  # Limit the number of concurrent requests (reduced to 1 to avoid 403 errors) 
 
 # Initialize Mistral client
 api_key = os.environ.get("MISTRAL_API_KEY") # Replace with your actual API key
@@ -90,9 +90,9 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["SERPER_API_KEY"] = os.getenv("SERPER_API_KEY", "")
 
 # Initialize models and tools
-llm = LLM(model="gemini/gemini-1.5-flash")
-llm_genai = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.4)
-embedding_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+llm = LLM(model="gemini/gemini-2.5-flash")
+llm_genai = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.4)
+embedding_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 serper_tool = SerperDevTool()
 
 # Constants
@@ -116,7 +116,7 @@ def format_timestamp(seconds):
 async def translate_text_async(text, target_language):
     """Translate text asynchronously using mtranslate."""
     try:
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(1.0)  # Increased delay to avoid rate limiting
         translated_text = await asyncio.to_thread(translate, text, target_language)
         return translated_text
     except Exception as e:
@@ -273,39 +273,72 @@ async def get_transcript_with_timestamps_async(video_id):
         return None, None, None
 
 async def generate_audio_and_save(text, lang, output_path):
-    """Generate audio using edge-tts."""
+    """Generate audio using gTTS."""
     try:
-        voice = VOICE_CONFIGS.get(lang, "en-AU-WilliamNeural")
-        communicate = edge_tts.Communicate(text, voice)
-        await communicate.save(output_path)
+        # Get language code, default to 'en'
+        lang_code = VOICE_CONFIGS.get(lang, 'en')
+        
+        # Use asyncio.to_thread to run synchronous gTTS in async context
+        def generate_audio():
+            tts = gTTS(text=text, lang=lang_code, slow=False)
+            tts.save(output_path)
+        
+        await asyncio.to_thread(generate_audio)
         return True
     except Exception as e:
         print(f"Error generating audio: {str(e)}")
         return False
     
-async def create_audio_segments(transcript_data, video_id, target_language):
-    """Generates and saves audio segments."""
+async def create_audio_segments(transcript_data, video_id, target_language, specific_segment=None):
+    """Generates and saves audio segments with timeout and error handling.
+    If specific_segment is provided, only generates that segment."""
     audio_path = os.path.join('data', video_id)
     os.makedirs(audio_path, exist_ok=True)
     
-    tasks = []
-    for segment in transcript_data:
-        if not segment['Text'].strip():
-            continue
-            
-        async def process_segment(segment_text, segment_num):
+    # Filter to specific segment if requested
+    if specific_segment is not None:
+        transcript_data = [s for s in transcript_data if s.get('Segment') == specific_segment]
+        print(f"🎵 Generating audio for segment {specific_segment}...")
+    else:
+        print(f"🎵 Generating audio segments for {len(transcript_data)} segments...")
+    
+    # Process segments with semaphore to limit concurrent requests
+    semaphore = asyncio.Semaphore(2)  # Max 2 concurrent audio tasks
+    
+    async def process_segment_with_semaphore(segment_text, segment_num):
+        async with semaphore:
             try:
                 translated_text = await translate_text_async(segment_text, target_language)
                 audio_file = os.path.join(audio_path, f"segment_{segment_num:04d}.mp3")
-                await generate_audio_and_save(translated_text, target_language, audio_file)
-                print(f"Processed segment {segment_num}")
+                
+                # Generate audio with timeout
+                try:
+                    success = await asyncio.wait_for(
+                        generate_audio_and_save(translated_text, target_language, audio_file),
+                        timeout=30  # 30 second timeout per segment
+                    )
+                    if success:
+                        print(f"✅ Segment {segment_num}: Generated")
+                except asyncio.TimeoutError:
+                    print(f"⚠️  Segment {segment_num}: Timeout (skipped)")
+                    
             except Exception as e:
-                print(f"Error processing segment {segment_num}: {str(e)}")
-        
-        tasks.append(process_segment(segment['Text'], segment['Segment']))
+                print(f"❌ Segment {segment_num}: Error - {str(e)[:50]}")
     
-    await asyncio.gather(*tasks)
-    print(f"Audio segments saved in: {audio_path}")
+    tasks = []
+    for segment in transcript_data:
+        if not segment.get('Text', '').strip():
+            continue
+            
+        tasks.append(process_segment_with_semaphore(segment['Text'], segment['Segment']))
+    
+    # Run tasks with a reasonable timeout
+    if tasks:
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=300)  # 5 min total
+            print(f"✅ Audio segments saved in: {audio_path}")
+        except asyncio.TimeoutError:
+            print(f"⚠️  Audio generation timed out (partial results saved in {audio_path})")
 
 class TranscriptStore:
     def __init__(self, video_id, transcript_original, source_lang, original_string_transcript, whole_string_transcript_english):
@@ -494,20 +527,54 @@ def chunk_transcript(transcript_data, max_words=50):
     return chunks
 
 def store_embeddings(chunks):
-    """Create FAISS index from document chunks"""
-    print(chunks)
+    """Create FAISS index from document chunks with rate limiting & retry logic"""
+    print(f"📊 Creating embeddings for {len(chunks)} chunks...")
     texts = [chunk["Text"] for chunk in chunks]
-    vector_store = FAISS.from_texts(texts, embedding_model)
-    return vector_store
+    
+    # Retry logic with exponential backoff for rate limiting
+    max_retries = 3
+    base_wait_time = 5  # Start with 5 seconds
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"🤖 Attempt {attempt + 1}/{max_retries}: Creating FAISS embeddings...")
+            vector_store = FAISS.from_texts(texts, embedding_model)
+            print("✅ FAISS embeddings created successfully")
+            return vector_store
+        
+        except Exception as e:
+            error_str = str(e)
+            
+            # Check if it's a rate limit error (429)
+            if "429" in error_str or "quota" in error_str.lower():
+                if attempt < max_retries - 1:
+                    wait_time = base_wait_time * (2 ** attempt)  # Exponential backoff
+                    print(f"⚠️  Rate limit hit (429/quota). Waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"❌ Rate limit exceeded after {max_retries} attempts")
+                    raise Exception(f"Embedding API rate limit exceeded. {error_str}")
+            else:
+                print(f"❌ Embedding creation failed: {error_str}")
+                raise
+    
+    return None
 
 def check_query_relevance(vector_store, query):
-    """Check if query is relevant to the transcript context"""
-    docs_and_scores = vector_store.similarity_search_with_score(query, k=1)
-    if not docs_and_scores:
-        return False
-    best_match, best_score = docs_and_scores[0]
-    similarity_score = 1 - best_score
-    return similarity_score >= SIMILARITY_THRESHOLD
+    """Check if query is relevant to the transcript context
+    With fallback for API failures"""
+    try:
+        docs_and_scores = vector_store.similarity_search_with_score(query, k=1)
+        if not docs_and_scores:
+            return False
+        best_match, best_score = docs_and_scores[0]
+        similarity_score = 1 - best_score
+        return similarity_score >= SIMILARITY_THRESHOLD
+    except Exception as e:
+        # Fallback: consider query relevant if it has content
+        print(f"⚠️  Relevance check failed, assuming query is relevant")
+        return len(query) > 0
 
 def get_conversational_chain():
     prompt_template = """
@@ -521,18 +588,78 @@ def get_conversational_chain():
     return chain
 
 def search_query_with_llm(vector_store, chunks, query):
-    """ Search for relevant chunks and use LLM to generate an answer """
-    docs_and_scores = vector_store.similarity_search_with_score(query, k=3)
-    best_match, best_score = docs_and_scores[0]
-    similarity_score = 1 - best_score
+    """ Search for relevant chunks and use LLM to generate an answer 
+    Falls back to simple text search if vector store fails """
+    try:
+        # Try vector search first
+        docs_and_scores = vector_store.similarity_search_with_score(query, k=3)
+        best_match, best_score = docs_and_scores[0]
+        similarity_score = 1 - best_score
 
-    if similarity_score < SIMILARITY_THRESHOLD:
-        return None
+        if similarity_score < SIMILARITY_THRESHOLD:
+            return None
 
-    best_chunks = [Document(page_content=best_match.page_content)]
-    qa_chain = get_conversational_chain()
-    answer = qa_chain.run(input_documents=best_chunks, question=query)
-    return answer
+        best_chunks = [Document(page_content=best_match.page_content)]
+        qa_chain = get_conversational_chain()
+        answer = qa_chain.run(input_documents=best_chunks, question=query)
+        return answer
+    
+    except Exception as e:
+        # Fallback: Simple text search without embeddings
+        print(f"⚠️  Vector search failed ({str(e)[:50]}), using fallback text search...")
+        return search_query_text_fallback(chunks, query)
+
+def search_query_text_fallback(chunks, query):
+    """ Fallback Q&A using simple text search + Mistral LLM (no embeddings needed) """
+    try:
+        # Split query into keywords
+        query_lower = query.lower()
+        keywords = [word for word in query_lower.split() if len(word) > 3]
+        
+        # Find best matching chunks using keyword matching
+        matched_chunks = []
+        for chunk in chunks:
+            text_lower = chunk.get("Text", "").lower()
+            keyword_count = sum(1 for kw in keywords if kw in text_lower)
+            
+            if keyword_count > 0:
+                matched_chunks.append({
+                    "text": chunk.get("Text", ""),
+                    "score": keyword_count
+                })
+        
+        if not matched_chunks:
+            return "I couldn't find relevant information in the transcript to answer your question."
+        
+        # Sort by relevance score and take top 2
+        matched_chunks.sort(key=lambda x: x["score"], reverse=True)
+        context_text = "\n".join([c["text"] for c in matched_chunks[:2]])
+        
+        # Use Mistral to generate answer from context
+        print(f"📝 Generating answer using Mistral (fallback)...")
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. Answer the user's question based on the provided context. Be concise and direct."
+            },
+            {
+                "role": "user",
+                "content": f"Context from video transcript:\n{context_text}\n\nQuestion: {query}\n\nAnswer:"
+            }
+        ]
+        
+        response = client.chat.complete(
+            model=model,
+            messages=messages,
+            max_tokens=200
+        )
+        
+        answer = response.choices[0].message.content
+        return answer
+    
+    except Exception as e:
+        print(f"❌ Fallback search failed: {str(e)}")
+        return f"Error generating answer: {str(e)[:100]}"
 
 def get_yt_details(video_id):
     """Fetches YouTube video title and channel."""
@@ -619,7 +746,8 @@ def load_faiss_index(video_id):
         raise RuntimeError(f"Failed to load FAISS index from memory: {str(e)}")
 
 async def precompute(video_id):
-    """ Precompute transcript and embeddings if not already stored in memory """
+    """ Precompute transcript and embeddings if not already stored in memory 
+    Falls back to text-only mode if embedding API fails """
     if is_processed(video_id):
         return {"status": "cached"}
 
@@ -629,16 +757,37 @@ async def precompute(video_id):
             return {"error": transcript["error"]}
 
         chunks = chunk_transcript(transcript)
-        vector_store = store_embeddings(chunks)
+        
+        # Try to create embeddings, but fall back gracefully
+        vector_store = None
+        embedding_failed = False
+        
+        try:
+            print("🤖 Attempting to create embeddings...")
+            vector_store = store_embeddings(chunks)
+            print("✅ Embeddings created successfully")
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                print(f"⚠️  Embedding API quota exceeded. Using text-based search instead.")
+                embedding_failed = True
+                # Create dummy vector store - we'll use fallback search
+                vector_store = None
+            else:
+                raise
 
         yt_channel, yt_title = get_yt_details(video_id)
-
         store_metadata(video_id, transcript, yt_channel, yt_title, chunks)
 
-        if not store_faiss_index(video_id, vector_store):
-            return {"error": "Failed to store FAISS index in memory"}
-
-        return {"status": "success", "video_id": video_id}
+        if vector_store:
+            if not store_faiss_index(video_id, vector_store):
+                print("⚠️  Failed to store FAISS index, but continuing with text search")
+        
+        status = "success_with_fallback" if embedding_failed else "success"
+        return {
+            "status": status,
+            "video_id": video_id,
+            "message": "Using text-based search due to API quota limits" if embedding_failed else None
+        }
     except Exception as e:
         return {"error": f"Precompute failed: {str(e)}"}
 
@@ -655,42 +804,71 @@ async def get_audio(video_id, target_language, segment_number):
         segment_number = int(segment_number)
         segment_path = f"data/{video_id}/segment_{segment_number:04d}.mp3"
 
+        # If file already exists, send it immediately
+        if os.path.exists(segment_path):
+            print(f"✅ Audio segment {segment_number} already exists. Sending...")
+            return await send_file(segment_path, mimetype="audio/mpeg")
+
+        # File doesn't exist - generate it (with timeout)
+        print(f"🎵 Generating audio for segment {segment_number} (async)...")
+        
         transcript_key = f"{video_id}_transcript"
         
-        if transcript_key in globals() and globals()[transcript_key].is_transcript_exists:
-            print(f"✅ Transcript found for {video_id}.")
+        if transcript_key not in globals():
+            print(f"Creating new transcript for {video_id}...")
+            globals()[transcript_key] = await TranscriptStore.create(video_id)
+        
+        transcript_data = globals()[transcript_key]
+        
+        if not transcript_data.is_transcript_exists:
+            return jsonify({"error": "No transcript available"}), 400
 
-            if os.path.exists(segment_path):
-                print(f"✅ Segment {segment_number} exists: {segment_path}. Sending file...")
-                asyncio.create_task(process_and_generate_audio(video_id, target_language, segment_number))
-                return await send_file(segment_path, mimetype="audio/mpeg")
-
-            print(f"🔍 Segment {segment_number} not found. Processing synchronously...")
-
-            transcript_data = globals()[transcript_key]
-            temp_trans = await process_transcript(
-                transcript_data.transcript_original,
-                transcript_data.whole_string_transcript_english,
-                video_id, transcript_data.original_video_lang, target_language, str(segment_number)
+        # Process audio with timeout
+        try:
+            segment = next(
+                (seg for seg in transcript_data.transcript_original if seg.get('Segment') == segment_number),
+                None
             )
-
-            await create_audio_segments(temp_trans, video_id, target_language)
-
+            if not segment:
+                return jsonify({"error": f"Segment {segment_number} not found"}), 404
+            temp_trans = [segment]
+            
+            # Generate with timeout
+            await asyncio.wait_for(
+                create_audio_segments(temp_trans, video_id, target_language, specific_segment=segment_number),
+                timeout=90  # 90 seconds timeout
+            )
+            
+            # Check if file was created
             if os.path.exists(segment_path):
-                print(f"✅ Segment created successfully: {segment_path}")
+                print(f"✅ Audio generated successfully!")
                 return await send_file(segment_path, mimetype="audio/mpeg")
             else:
-                print("❌ Segment creation failed!")
-                return jsonify({"error": "Segment could not be generated"}), 500
-
-        else:
-            print(f"🚀 Transcript not found for {video_id}. Creating new transcript...")
-            globals()[transcript_key] = await TranscriptStore.create(video_id)
-            return await get_audio(video_id, target_language, segment_number)
+                print("⚠️  Audio generation timed out but may still be processing...")
+                return jsonify({
+                    "status": "processing",
+                    "message": "Audio is being generated. Please retry in a few seconds.",
+                    "segment": segment_number,
+                    "retry_url": f"/listen_audio/{video_id}/{target_language}/{segment_number}"
+                }), 202  # Accepted
+        
+        except asyncio.TimeoutError:
+            print(f"⚠️  Audio generation timed out for segment {segment_number}")
+            # Start background processing
+            asyncio.create_task(process_and_generate_audio(video_id, target_language, segment_number))
+            return jsonify({
+                "status": "processing",
+                "message": "Audio generation started in background. Please retry shortly.",
+                "segment": segment_number,
+                "estimated_wait": "10-30 seconds",
+                "retry_url": f"/listen_audio/{video_id}/{target_language}/{segment_number}"
+            }), 202
 
     except Exception as e:
         print(f"❌ Error in get_audio: {e}")
-        return jsonify({"error": f"An error occurred: {e}"}), 500
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"An error occurred: {str(e)[:100]}"}), 500
 
 @app.route('/show_transcript/<video_id>')
 async def show_transcript(video_id):
@@ -793,7 +971,8 @@ async def precompute_route(video_id):
 
 @app.route('/process', methods=['POST'])
 async def process():
-    """ Processes user query using stored transcript and FAISS index from memory. """
+    """ Processes user query using stored transcript and FAISS index from memory.
+    Falls back to text search if embeddings fail. """
     data = await request.json
     query = data.get('query')
     mode = data.get('addition_mode', True)
@@ -808,13 +987,14 @@ async def process():
             return jsonify({"error": precompute_result["error"]}), 400
 
     try:
-        vector_store = load_faiss_index(video_id)
-    except (KeyError, RuntimeError) as e:
+        # Try to get vector store, but it might be None if embeddings failed
+        try:
+            vector_store = load_faiss_index(video_id)
+        except (KeyError, RuntimeError):
+            # Vector store not available, will use fallback
+            vector_store = None
+    except Exception as e:
         return jsonify({"error": f"Failed to load FAISS index: {str(e)}"}), 400
-
-    if not vector_store:
-        return jsonify({"error": "Failed to load FAISS index"}), 400
-
     cached_data = metadata_cache.get(video_id, {})
     transcript = cached_data.get("transcript")
     yt_channel = cached_data.get("yt_channel", "Unknown Channel")
@@ -824,10 +1004,16 @@ async def process():
     if not transcript:
         return jsonify({"error": "Transcript not found in cache"}), 400
 
-    if not check_query_relevance(vector_store, query):
-        return jsonify({"final_answer": "Query out of context."}), 200
-
-    context_answer = search_query_with_llm(vector_store, chunks, query)
+    # Check relevance only if vector store is available
+    if vector_store:
+        if not check_query_relevance(vector_store, query):
+            return jsonify({"final_answer": "Query out of context."}), 200
+        context_answer = search_query_with_llm(vector_store, chunks, query)
+    else:
+        # Use fallback text search
+        print("📝 Using fallback text-based search (no embeddings available)")
+        context_answer = search_query_text_fallback(chunks, query)
+    
     refined_answer = refine_answer_with_serper(query, context_answer, yt_channel, yt_title) if mode else context_answer
 
     return jsonify({
@@ -849,13 +1035,16 @@ async def process_and_generate_audio(video_id, target_language, segment_number):
         transcript_data = globals()[f"{video_id}_transcript"]
         print("Inside process_transcript")
         if globals()[f"{video_id}_transcript"] and transcript_data.is_transcript_exists:
-            temp_trans = await process_transcript(
-                transcript_data.transcript_original,
-                transcript_data.whole_string_transcript_english,
-                video_id, transcript_data.original_video_lang, target_language, str(segment_number)
+            segment = next(
+                (seg for seg in transcript_data.transcript_original if seg.get('Segment') == segment_number),
+                None
             )
+            if not segment:
+                print(f"⚠ Segment {segment_number} not found; skipping background processing.")
+                return
+            temp_trans = [segment]
             print("inside create_audio_segments")
-            await create_audio_segments(temp_trans, video_id, target_language)
+            await create_audio_segments(temp_trans, video_id, target_language, specific_segment=segment_number)
             print(f"✅ Background processing completed for segment {segment_number}.")
         else:
             print(f"⚠ Transcript not found for {video_id}, skipping background processing.")
