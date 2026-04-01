@@ -1,0 +1,15 @@
+env/
+.env
+.git/
+__pycache__/
+*.pyc
+*.pyo
+*.pyc
+data/
+tests/
+*.mp3
+.gitignore
+README.md
+SETUP_GUIDE.md
+TECHNICAL_DEEP_DIVE.md
+backend/data/
